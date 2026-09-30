@@ -2,7 +2,7 @@ extends Node
 
 const PORT := 27841
 const DISCOVERY_PORT := 27842
-const VERSION := "aschenmark-lan-1"
+const VERSION := "aschenmark-lan-2"
 var world: Node3D
 var running := false
 var hosting := false
@@ -22,9 +22,20 @@ var address: LineEdit
 var nickname: LineEdit
 var rooms: ItemList
 var room_addresses: Array[String] = []
-var pending_jump := false
 var snapshot_sequence := 0
 var received_sequence := -1
+const SEND_INTERVAL := 1.0 / 30.0
+const INPUT_WINDOW := 8
+var state_clock := 0.0
+var state_digest := 0
+var force_state := true
+var state_packets := 0
+var input_sequence := 0
+var input_frames: Array[PackedFloat64Array] = []
+var predicted_positions: Dictionary = {}
+var motion_sequences: Dictionary = {}
+var enemy_sequences: Dictionary = {}
+var local_initialized := false
 
 func _ready() -> void:
 	world = get_parent()
@@ -172,16 +183,130 @@ func _process(delta: float) -> void:
 		connection_clock += delta
 		if connection_clock>8: on_connection_failed()
 	if not running: return
-	send_clock += delta
-	if send_clock<0.05: return
-	send_clock = 0
 	if hosting:
-		broadcast_snapshot()
+		state_clock += delta
+		if state_clock >= 0.1:
+			state_clock = fmod(state_clock,0.1)
+			broadcast_snapshot(false)
+	send_clock += delta
+	if send_clock < SEND_INTERVAL: return
+	send_clock = fmod(send_clock,SEND_INTERVAL)
+	if hosting:
+		broadcast_motion()
+	elif not input_frames.is_empty():
+		submit_frames.rpc_id(1,input_frames)
+
+# Record the actual physics input, including one-shot jumps. Resending the short
+# window recovers dropped packets without applying a jump or movement twice.
+func record_prediction(move: Vector2, jump: bool) -> void:
+	if not running or hosting or not local_initialized: return
+	var p = world.player
+	input_sequence += 1
+	var flags := (1 if Input.is_action_pressed("block") else 0) | (2 if Input.is_action_pressed("sprint") else 0) | (4 if jump else 0)
+	input_frames.append(PackedFloat64Array([input_sequence,move.x,move.y,p.rotation.y,p.camera.rotation.x,p.selected_direction,flags]))
+	if input_frames.size() > INPUT_WINDOW: input_frames.pop_front()
+	predicted_positions[input_sequence] = p.position
+	while predicted_positions.size() > 128: predicted_positions.erase(predicted_positions.keys()[0])
+
+@rpc("any_peer","call_remote","unreliable_ordered",1)
+func submit_frames(frames: Array) -> void:
+	if not hosting: return
+	var id := multiplayer.get_remote_sender_id()
+	if not actors.has(id) or frames.size() > INPUT_WINDOW: return
+	queue_frames(actors[id],frames)
+
+func queue_frames(actor: Node3D, frames: Array) -> void:
+	for frame in frames:
+		if not frame is PackedFloat64Array or frame.size()!=7: continue
+		var finite := true
+		for value in frame:
+			if not is_finite(value): finite=false
+		if not finite: continue
+		var sequence := int(frame[0])
+		if sequence<=actor.last_input_received or sequence>2147483647: continue
+		if actor.input_queue.size()>=16: break
+		actor.last_input_received=sequence
+		actor.input_queue.append(frame)
+		actor.input_age=0
+
+func reconcile(position: Vector3, acknowledged: int) -> void:
+	if not local_initialized or not predicted_positions.has(acknowledged): return
+	var correction: Vector3 = position-predicted_positions[acknowledged]
+	# Compare against the prediction at the acknowledged tick, never the player's
+	# current position: movement still in transit remains immediately responsive.
+	if correction.length()>0.02:
+		world.player.position += correction
+		world.player.camera_correction -= correction
+		if correction.length()>2: world.player.camera_correction=Vector3.ZERO
+		for sequence in predicted_positions:
+			predicted_positions[sequence] += correction
+	for sequence in predicted_positions.keys():
+		if sequence<=acknowledged: predicted_positions.erase(sequence)
+
+func broadcast_motion() -> void:
+	snapshot_sequence += 1
+	for id in actors:
+		var p = actors[id]
+		var flags := (1 if p.blocking else 0) | (2 if p.winding else 0)
+		receive_player_motion.rpc(snapshot_sequence,id,p.position,p.velocity,p.rotation.y,p.last_input_processed,p.stamina,p.guard_direction,p.attack_direction,flags,p.swing_time)
+	var enemies := enemies_in_world()
+	for i in enemies.size():
+		var e = enemies[i]
+		if not e.alive: continue
+		var flags := (1 if e.blocking else 0) | (2 if e.attacking else 0)
+		receive_enemy_motion.rpc(snapshot_sequence,i,e.position,e.rotation.y,e.guard_direction,e.attack_direction,flags,e.swing_time,e.blade.position,e.blade.rotation)
+
+# Each entity uses a small packet; changing world dictionaries cannot fragment
+# or queue movement behind reliable inventory/health transfers.
+@rpc("authority","call_remote","unreliable_ordered",5)
+func receive_player_motion(sequence: int, id: int, pos: Vector3, _velocity: Vector3, yaw: float, acknowledged: int, stamina: float, guard: int, attack: int, flags: int, swing: float) -> void:
+	if hosting or sequence<=motion_sequences.get(id,-1) or not actors.has(id): return
+	motion_sequences[id]=sequence
+	var p = actors[id]
+	if p.local_control:
+		reconcile(pos,acknowledged)
 	else:
-		var p = world.player
-		var move := Input.get_vector("left","right","forward","back") if p.active and p.alive else Vector2.ZERO
-		submit_input.rpc_id(1,move,p.rotation.y,p.camera.rotation.x,p.selected_direction,p.active and Input.is_action_pressed("block"),p.active and Input.is_action_pressed("sprint"),pending_jump)
-		pending_jump = false
+		var old_pos: Vector3=p.position
+		var visual_pos: Vector3=p.avatar.global_position
+		var old_yaw: float=p.rotation.y+p.avatar.rotation.y
+		p.position=pos
+		p.rotation.y=yaw
+		p.avatar.global_position=visual_pos
+		p.avatar.rotation.y=wrapf(old_yaw-yaw,-PI,PI)
+		if old_pos.distance_to(pos)>2: p.avatar.position=Vector3.ZERO
+		p.blocking=bool(flags&1)
+		p.winding=bool(flags&2)
+		p.guard_direction=guard
+		p.attack_direction=attack
+		p.swing_time=swing
+	p.stamina=stamina
+
+@rpc("authority","call_remote","unreliable_ordered",6)
+func receive_enemy_motion(sequence: int, index: int, pos: Vector3, yaw: float, guard: int, attack: int, flags: int, swing: float, blade_pos: Vector3, blade_rot: Vector3) -> void:
+	if hosting or sequence<=enemy_sequences.get(index,-1): return
+	var nodes := enemies_in_world()
+	if index<0 or index>=nodes.size(): return
+	enemy_sequences[index]=sequence
+	var e = nodes[index]
+	if not e.alive: return
+	var old_pos: Vector3=e.position
+	var visual_pos: Vector3=e.body.global_position
+	var old_yaw: float=e.rotation.y+e.body.rotation.y
+	e.position=pos
+	e.rotation.y=yaw
+	e.body.global_position=visual_pos
+	e.body.rotation.y=wrapf(old_yaw-yaw,-PI,PI)
+	if old_pos.distance_to(pos)>2: e.body.position=Vector3.ZERO
+	e.blocking=bool(flags&1)
+	e.attacking=bool(flags&2)
+	e.guard_direction=guard
+	e.attack_direction=attack
+	e.swing_time=swing
+	e.net_blade_pos=blade_pos
+	e.net_blade_rot=blade_rot
+	e.bar.visible=e.position.distance_to(world.player.position)<13
+	e.direction_label.visible=e.blocking or e.attacking
+	e.direction_label.text=("BLOCK "+world.PlayerScript.Combat.NAMES[world.PlayerScript.Combat.incoming(guard)]) if e.blocking else world.PlayerScript.Combat.ARROWS[world.PlayerScript.Combat.incoming(attack)]
 
 func poll_discovery(delta: float) -> void:
 	if not discovery.is_bound(): return
@@ -228,6 +353,7 @@ func on_peer_connected(id: int) -> void:
 			peer.disconnect_peer(id)
 			return
 		spawn_actor(id,"Wanderer")
+		force_state=true
 
 func spawn_actor(id: int, display_name: String) -> void:
 	if actors.has(id): return
@@ -264,6 +390,7 @@ func register_name(value: String, version: String) -> void:
 		peer.disconnect_peer(id)
 		return
 	actors[id].display_name=clean_name(value)
+	force_state=true
 
 func on_peer_disconnected(id: int) -> void:
 	if actors.has(id):
@@ -291,25 +418,21 @@ func leave_game() -> void:
 	for id in actors:
 		if actors[id]!=world.player: actors[id].queue_free()
 	actors.clear()
+	input_frames.clear()
+	predicted_positions.clear()
+	motion_sequences.clear()
+	enemy_sequences.clear()
+	local_initialized=false
+	input_sequence=0
+	send_clock=0
+	state_clock=0
+	received_sequence=-1
+	force_state=true
+	state_digest=0
 
 func _exit_tree() -> void:
 	discovery.close()
 	if peer: peer.close()
-
-@rpc("any_peer","call_remote","unreliable_ordered",1)
-func submit_input(move: Vector2, yaw: float, pitch: float, direction: int, block: bool, sprint: bool, jump: bool) -> void:
-	if not hosting: return
-	var id := multiplayer.get_remote_sender_id()
-	if not actors.has(id) or not move.is_finite() or not is_finite(yaw) or not is_finite(pitch): return
-	var actor = actors[id]
-	actor.net_move=move.limit_length(1)
-	actor.rotation.y=wrapf(yaw,-PI,PI)
-	actor.camera.rotation.x=clampf(pitch,-1.25,1.25)
-	actor.select_direction(clampi(direction,0,3))
-	actor.net_block=block
-	actor.net_sprint=sprint
-	actor.net_jump=actor.net_jump or jump
-	actor.input_age=0
 
 func command(action: String, direction := 1) -> void:
 	if running and not hosting: request_action.rpc_id(1,action,direction,world.player.rotation.y,world.player.camera.rotation.x)
@@ -346,6 +469,8 @@ func respawn(actor: Node3D) -> void:
 	actor.winding=false
 	actor.blocking=false
 	actor.cooldown=0.5
+	actor.input_queue.clear()
+	force_state=true
 
 func safe_zone(pos: Vector3) -> bool:
 	return Vector2(pos.x,pos.z-10).length()<10
@@ -415,7 +540,7 @@ func interact_as(actor: Node3D) -> void:
 	world.gold=original.gold
 	world.update_stats()
 
-func broadcast_snapshot() -> void:
+func broadcast_snapshot(force := true) -> void:
 	snapshot_sequence+=1
 	var players: Dictionary={}
 	for id in actors:
@@ -427,6 +552,17 @@ func broadcast_snapshot() -> void:
 	var items: Array=[]
 	for resource in world.resources:
 		items.append({"kind":resource.kind,"pos":resource.pos,"used":resource.get("used",false),"amount":resource.get("amount",0)})
+	var stable_players: Dictionary={}
+	for id in players:
+		var d: Dictionary=players[id]
+		stable_players[id]=[d.hp,d.alive,d.weapon,d.name,d.wood,d.ore,d.gold]
+	var stable_enemies: Array=[]
+	for e in enemies: stable_enemies.append([e.hp,e.alive])
+	var digest := hash([stable_players,stable_enemies,items,world.boss_dead,world.kills,world.victory])
+	if not force and not force_state and digest==state_digest: return
+	state_digest=digest
+	force_state=false
+	state_packets+=1
 	receive_snapshot.rpc(snapshot_sequence,players,enemies,items,world.boss_dead,world.kills,world.victory)
 
 @rpc("authority","call_remote","reliable",3)
@@ -438,21 +574,16 @@ func receive_snapshot(sequence: int, players: Dictionary, enemies: Array, items:
 		if not actors.has(id): spawn_actor(id,players[id].name)
 		var p=actors[id]
 		var data: Dictionary=players[id]
-		if id!=my_id:
-			var old_position: Vector3=p.position
+		if not motion_sequences.has(id) or (id==my_id and not local_initialized):
 			p.position=data.pos
-			if is_instance_valid(p.avatar): p.avatar.position += old_position-data.pos
 			p.rotation.y=data.yaw
-			p.blocking=data.block
-			p.guard_direction=data.guard
-			p.attack_direction=data.attack
-			p.winding=data.winding
-			p.swing_time=data.swing
-		elif p.position.distance_to(data.pos)>0.3:
-			p.position=p.position.lerp(data.pos,0.6)
+			p.stamina=data.stamina
+		if id==my_id and not local_initialized:
+			local_initialized=true
+			input_frames.clear()
+			predicted_positions.clear()
 		var was_alive: bool=p.alive
 		p.health=data.hp
-		p.stamina=data.stamina
 		p.alive=data.alive
 		p.collision_layer=1 if p.alive else 0
 		p.collision_mask=1 if p.alive else 0
@@ -464,6 +595,10 @@ func receive_snapshot(sequence: int, players: Dictionary, enemies: Array, items:
 		if id==my_id and was_alive and not p.alive: world.on_death()
 		if id==my_id and not was_alive and p.alive:
 			p.position=data.pos
+			p.velocity=Vector3.ZERO
+			p.camera_correction=Vector3.ZERO
+			input_frames.clear()
+			predicted_positions.clear()
 			world.start_or_resume()
 	for id in actors.keys():
 		if not players.has(id):
@@ -481,17 +616,13 @@ func receive_snapshot(sequence: int, players: Dictionary, enemies: Array, items:
 		if e.alive and not d.alive:
 			e.health=1
 			e.take_damage(2)
-		e.position=d.pos
-		e.rotation.y=d.yaw
+		if not enemy_sequences.has(i):
+			e.position=d.pos
+			e.rotation.y=d.yaw
+			e.net_blade_pos=d.blade_pos
+			e.net_blade_rot=d.blade_rot
 		e.health=d.hp
 		e.alive=d.alive
-		e.blocking=d.block
-		e.guard_direction=d.guard
-		e.attack_direction=d.attack
-		e.attacking=d.winding
-		e.swing_time=d.swing
-		e.blade.position=d.blade_pos
-		e.blade.rotation=d.blade_rot
 		e.bar.scale.x=maxf(0.01,e.health/(180.0 if e.boss else 85.0))
 		e.bar.visible=e.alive and e.position.distance_to(world.player.position)<13
 		e.direction_label.visible=e.alive and (e.blocking or e.attacking)

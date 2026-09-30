@@ -48,7 +48,10 @@ func run() -> void:
 	remote.position=Vector3(0,0.1,-10)
 	client_world.player.position=remote.position
 	client_world.net.send_clock=-10
-	client_world.net.submit_input.rpc_id(1,Vector2(1,0),0.0,0.0,0,false,false,false)
+	var frames: Array=[]
+	for sequence in range(remote.last_input_received+1,remote.last_input_received+9):
+		frames.append(PackedFloat64Array([sequence,1,0,0,0,0,0]))
+	client_world.net.submit_frames.rpc_id(1,frames)
 	await create_timer(0.18).timeout
 	check(remote.position.x>0.2,"Client movement is simulated by host")
 	remote.position=Vector3(0,0.1,-10)

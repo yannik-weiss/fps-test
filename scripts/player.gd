@@ -39,6 +39,11 @@ var net_block := false
 var net_sprint := false
 var net_jump := false
 var input_age := 0.0
+var input_queue: Array[PackedFloat64Array] = []
+var last_input_received := 0
+var last_input_processed := 0
+var camera_correction := Vector3.ZERO
+var motion_credit := 0.0
 var avatar: Node3D
 var avatar_sword: Node3D
 var avatar_rig: Dictionary
@@ -84,7 +89,8 @@ func _ready() -> void:
 func _process(delta: float) -> void:
 	if local_control or not is_instance_valid(avatar): return
 	avatar.visible = alive
-	avatar.position=avatar.position.lerp(Vector3.ZERO,minf(1,delta*16))
+	avatar.position=avatar.position.lerp(Vector3.ZERO,1-exp(-delta*20))
+	avatar.rotation.y=lerp_angle(avatar.rotation.y,0,1-exp(-delta*20))
 	nameplate.text = display_name + (" · BLOCK " + Combat.NAMES[Combat.incoming(guard_direction)] if blocking else "")
 	avatar_sword.position = Vector3(0.43,1.9 if (winding and attack_direction==1) or (blocking and guard_direction==1) else 1.05,-0.25)
 	var pose := Combat.pose(guard_direction,true) if blocking else (Combat.pose(attack_direction) if winding else Vector3.ZERO)
@@ -120,8 +126,6 @@ func _unhandled_input(event: InputEvent) -> void:
 		world.net.command("release")
 	if event.is_action_pressed("feint"):
 		feint()
-	if event.is_action_pressed("jump") and world.net.running and not world.net.hosting:
-		world.net.pending_jump=true
 	if event.is_action_pressed("interact"):
 		world.interact()
 
@@ -133,6 +137,16 @@ func _physics_process(delta: float) -> void:
 	if not active or not alive:
 		return
 	if not local_control and not world.net.hosting: return
+	var simulate_motion := true
+	var frame_sequence := 0
+	if not local_control:
+		# Save elapsed simulation time while a packet is in transit. Catch up only
+		# this earned time, so packet jitter cannot create a permanent input queue
+		# and sending extra commands cannot make a player run faster.
+		motion_credit=minf(0.15,motion_credit+delta)
+		if last_input_received>0:
+			simulate_motion=not input_queue.is_empty()
+			if simulate_motion: frame_sequence=apply_input_frame(input_queue.pop_front())
 	input_age += delta
 	if not local_control and input_age>0.3:
 		net_move=Vector2.ZERO
@@ -154,27 +168,26 @@ func _physics_process(delta: float) -> void:
 	blocking = (Input.is_action_pressed("block") if local_control else net_block) and not winding and swing_time == 0 and stamina >= 15 and stagger == 0
 	block_age = block_age + delta if blocking and was_blocking else 0.0
 	var input := Input.get_vector("left", "right", "forward", "back") if local_control else net_move
-	var direction := (transform.basis * Vector3(input.x, 0, input.y)).normalized()
-	var running := (Input.is_action_pressed("sprint") if local_control else net_sprint) and input.length() > 0 and stamina > 4 and not blocking
-	var speed := 7.5 if running else 4.4
-	if blocking:
-		speed = 2.2
-	velocity.x = move_toward(velocity.x, direction.x * speed + knockback.x, delta * 30)
-	velocity.z = move_toward(velocity.z, direction.z * speed + knockback.z, delta * 30)
-	if not is_on_floor():
-		velocity.y -= 22 * delta
-	elif (Input.is_action_just_pressed("jump") if local_control else net_jump) and stamina >= 12:
-		velocity.y = 7
-		stamina -= 12
-	net_jump=false
-	if running:
-		stamina = maxf(0, stamina - 17 * delta)
-	elif cooldown == 0 and not winding:
-		stamina = minf(100, stamina + (10 if blocking else 23) * delta)
-	move_and_slide()
-	knockback = knockback.move_toward(Vector3.ZERO, delta * 18)
+	var running := (Input.is_action_pressed("sprint") if local_control else net_sprint) and input.length()>0 and stamina>4 and not blocking
+	var jump := Input.is_action_just_pressed("jump") if local_control else net_jump
+	if simulate_motion:
+		simulate_movement(input,running,jump,delta)
+		if not local_control:
+			motion_credit=maxf(0,motion_credit-delta)
+			if frame_sequence>0: last_input_processed=frame_sequence
+			while not input_queue.is_empty() and motion_credit>=delta:
+				last_input_processed=apply_input_frame(input_queue.pop_front())
+				blocking=net_block and not winding and swing_time==0 and stamina>=15 and stagger==0
+				input=net_move
+				running=net_sprint and input.length()>0 and stamina>4 and not blocking
+				simulate_movement(input,running,net_jump,delta)
+				motion_credit-=delta
+	if local_control:
+		world.net.record_prediction(input,jump)
+	camera_correction=camera_correction.lerp(Vector3.ZERO,1-exp(-delta*18))
 	step_time += delta * (11 if running else 7) * input.length()
 	camera.position = Vector3(sin(Time.get_ticks_msec() * 0.07) * shake * 0.035, 1.6 + sin(step_time) * 0.035 * input.length() + cos(Time.get_ticks_msec() * 0.09) * shake * 0.025, 0)
+	camera.position += basis.inverse()*camera_correction
 	camera.fov = lerpf(camera.fov, 80 if running else 78, delta * 6)
 	var target_pos := Vector3(0.42, -0.31, -0.65)
 	var target_rot := Vector3(-0.25, 0, -0.22)
@@ -195,6 +208,32 @@ func _physics_process(delta: float) -> void:
 	sword.position = sword.position.lerp(target_pos, minf(1, delta * 18))
 	sword.rotation = sword.rotation.lerp(target_rot, minf(1, delta * 20))
 	stats_changed.emit()
+
+func apply_input_frame(frame: PackedFloat64Array) -> int:
+	net_move=Vector2(frame[1],frame[2]).limit_length(1)
+	rotation.y=wrapf(frame[3],-PI,PI)
+	camera.rotation.x=clampf(frame[4],-1.25,1.25)
+	select_direction(clampi(int(frame[5]),0,3))
+	var flags := int(frame[6])
+	net_block=bool(flags&1)
+	net_sprint=bool(flags&2)
+	net_jump=bool(flags&4)
+	return int(frame[0])
+
+func simulate_movement(input: Vector2, running: bool, jump: bool, delta: float) -> void:
+	var direction := (transform.basis*Vector3(input.x,0,input.y)).normalized()
+	var speed := 2.2 if blocking else (7.5 if running else 4.4)
+	velocity.x=move_toward(velocity.x,direction.x*speed+knockback.x,delta*30)
+	velocity.z=move_toward(velocity.z,direction.z*speed+knockback.z,delta*30)
+	if not is_on_floor(): velocity.y-=22*delta
+	elif jump and stamina>=12:
+		velocity.y=7
+		stamina-=12
+	net_jump=false
+	if running: stamina=maxf(0,stamina-17*delta)
+	elif cooldown==0 and not winding: stamina=minf(100,stamina+(10 if blocking else 23)*delta)
+	move_and_slide()
+	knockback=knockback.move_toward(Vector3.ZERO,delta*18)
 
 func attack(held := false) -> void:
 	if not active or not alive or cooldown > 0 or stamina < 20 or blocking or winding or stagger > 0:

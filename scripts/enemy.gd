@@ -29,6 +29,8 @@ var will_feint := false
 var feinted := false
 var feint_gap := 0.0
 var ai_enabled := true
+var net_blade_pos := Vector3(0.47,0.85,-0.25)
+var net_blade_rot := Vector3.ZERO
 var flash_material: StandardMaterial3D
 var knockback := Vector3.ZERO
 var legs: Array[Node3D] = []
@@ -72,6 +74,15 @@ func _ready() -> void:
 	flash_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	if boss:
 		body.scale = Vector3.ONE * 1.12
+
+func _process(delta: float) -> void:
+	if ai_enabled or not alive: return
+	var blend := 1-exp(-delta*20)
+	body.position=body.position.lerp(Vector3.ZERO,blend)
+	body.rotation.y=lerp_angle(body.rotation.y,0,blend)
+	blade.position=blade.position.lerp(net_blade_pos,blend)
+	blade.rotation=blade.rotation.lerp(net_blade_rot,blend)
+	world.art.animate_arm(rig,blade)
 
 func _physics_process(delta: float) -> void:
 	if not alive or not ai_enabled or (world.hit_stop>0 and not world.net.running):

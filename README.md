@@ -66,10 +66,16 @@ Auf macOS mit der hier installierten Godot-App:
 
 Die Suche verwendet UDP-Broadcast, mit gezielten Antworten auf den Suchenden. **UPnP ist nicht erforderlich:** Es dient zur Router-Portfreigabe; die LAN-Suche benötigt keine Internet-Portfreigabe. Das Spiel legt keine Routerfreigaben an und akzeptiert direkte Verbindungen zu privaten IPv4- und Loopback-Adressen. Gastnetze/WLAN-Client-Isolation können die Suche und Verbindung verhindern. Falls das Betriebssystem fragt, Godot für das lokale Netzwerk zulassen. Auf dem Gastgeber müssen UDP 27841 (Spiel) und 27842 (Suche) erreichbar sein. Bei mehreren Netzwerksegmenten die direkte IP nutzen.
 
-Gegner, Treffer, Rohstoffe, Waffenverbesserungen und Beute werden vom Gastgeber berechnet. Bewegung wird beim Client vorhergesagt und mit dem Gastgeber abgeglichen. Ein verbrauchter Rohstoff oder Beutebeutel kann nur einmal abgeholt werden; auch später beitretende Spieler erhalten den aktuellen Weltzustand. Die Welt und die verfügbaren Ressourcen bleiben die kleine Prototyp-Welt; es gibt noch keine neue große Multiplayer-Karte oder Speicherdatei. Die Sitzung endet mit dem Gastgeber, ohne Host-Migration.
+Gegner, Treffer, Rohstoffe, Waffenverbesserungen und Beute werden vom Gastgeber berechnet. Bewegung reagiert sofort lokal. Der Abgleich verwendet die bestätigten Physikeingaben, sodass noch unterwegs befindliche Bewegung nicht zurückgezogen wird. Kleine Bewegungs- und Kampfpose-Pakete laufen mit 30 Hz getrennt von den zuverlässig übertragenen Weltänderungen; Figuren und Klingen werden zwischen Updates geglättet. Ein kurzes Eingabefenster fängt verlorene Pakete ab und verhindert doppelte Sprünge. Alle Teilnehmer benötigen dieselbe aktualisierte Spielversion (LAN-Protokoll 2). Ein verbrauchter Rohstoff oder Beutebeutel kann nur einmal abgeholt werden; auch später beitretende Spieler erhalten den aktuellen Weltzustand. Die Welt und die verfügbaren Ressourcen bleiben die kleine Prototyp-Welt; es gibt noch keine neue große Multiplayer-Karte oder Speicherdatei. Die Sitzung endet mit dem Gastgeber, ohne Host-Migration.
 
 `tests/lan_integration.gd` verbindet über echte Loopback-ENet-Sockets einen Gastgeber mit zwei Clients in getrennten Physikwelten. 22 Prüfungen decken UDP-Rundensuche, Verbindung, Namen, Bewegung, PvP-Schaden und Richtungsblocks, Lagerschutz, einmaliges Sammeln, Inventar, PvE-Tod und Beute, späteren Beitritt, Respawn, Verlassen und Host-Abbruch ab. Zwei physische Rechner und die Netzwerk-/Firewall-Einstellungen vor Ort wurden hier nicht getestet.
 
 ```sh
 /Applications/Godot.app/Contents/MacOS/Godot --headless --path . --script res://tests/lan_integration.gd
+```
+
+`tests/network_motion.gd` prüft zusätzlich Bewegung mit 100 ms künstlicher Eingabeverzögerung, 25 % Paketverlust und doppelten Paketen. 18 Prüfungen decken Vorhersage und Abgleich, Warteschlangen, Paketgröße, Sprünge, veraltete Updates, die Erholung nach längeren Paketlücken sowie das Glätten von Spieler-, Gegner- und Schwertbewegungen ab.
+
+```sh
+/Applications/Godot.app/Contents/MacOS/Godot --headless --path . --script res://tests/network_motion.gd
 ```
