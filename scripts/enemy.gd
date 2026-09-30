@@ -3,7 +3,14 @@ extends CharacterBody3D
 const Combat = preload("res://scripts/combat.gd")
 
 var world: Node3D
-var health := 85.0
+const Fighter = preload("res://scripts/fighter.gd")
+var combat
+var _health := 85.0
+var health: float:
+	get: return combat.health if is_instance_valid(combat) else _health
+	set(value):
+		_health=value
+		if is_instance_valid(combat): combat.health=value
 var alive := true
 var boss := false
 var home := Vector3.ZERO
@@ -19,7 +26,12 @@ var direction_label: Label3D
 var attack_direction := Combat.Direction.TOP
 var guard_direction := Combat.Direction.TOP
 var blocking := false
-var stamina := 80.0
+var _stamina := 80.0
+var stamina: float:
+	get: return combat.stamina if is_instance_valid(combat) else _stamina
+	set(value):
+		_stamina=value
+		if is_instance_valid(combat): combat.stamina=value
 var guard_lock := 0.0
 var reaction := 0.0
 var stagger := 0.0
@@ -36,13 +48,25 @@ var knockback := Vector3.ZERO
 var legs: Array[Node3D] = []
 var rig: Dictionary = {}
 var target_player: CharacterBody3D
+var hold_time := 0.0
+var reacting := false
+var attack_pause := 1.0
+var strafe_clock := 0.0
+var strafe_sign := 1.0
+var block_choice := 1
+var parry_attempted := false
+var weapon_pivot: Node3D
+var hit_tween: Tween
 
 func _ready() -> void:
 	world = get_parent()
 	home = position
 	add_to_group("enemies")
 	health = 180 if boss else 85
+	collision_layer=2
+	collision_mask=3
 	var collider := CollisionShape3D.new()
+	collider.name="CollisionShape3D"
 	var capsule := CapsuleShape3D.new()
 	capsule.radius = 0.4
 	capsule.height = 1.9
@@ -55,7 +79,11 @@ func _ready() -> void:
 	legs.assign(rig.legs)
 	blade = Node3D.new()
 	blade.position = Vector3(0.47, 0.85, -0.25)
-	body.add_child(blade)
+	weapon_pivot=Node3D.new()
+	weapon_pivot.position.y=1.45
+	weapon_pivot.scale=Vector3.ONE*1.4
+	body.add_child(weapon_pivot)
+	weapon_pivot.add_child(blade)
 	world.art.sword(blade,false)
 	marker = world.box(self, Vector3(0.2, 0.2, 0.2), Vector3(0, 2.35, 0), world.warning_mat)
 	marker.rotation.z = PI / 4
@@ -72,11 +100,23 @@ func _ready() -> void:
 	add_child(direction_label)
 	flash_material = world.material(Color("edc5a0"))
 	flash_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	if boss:
-		body.scale = Vector3.ONE * 1.12
+	if boss: body.scale=Vector3.ONE*1.12
+	combat=Fighter.new()
+	combat.name="MeleeCombat"
+	combat.profile=preload("res://combat/sword_profile.tres")
+	combat.weapon=blade
+	combat.max_health=180 if boss else 85
+	combat.max_stamina=80
+	combat.base_damage=30 if boss else 22
+	combat.glow_on_windup=true
+	add_child(combat)
+	combat.swing_started.connect(func(_dir): world.sword_sound())
 
 func _process(delta: float) -> void:
 	if ai_enabled or not alive: return
+	flash=maxf(0,flash-delta)
+	for mesh in body.get_children():
+		if mesh is MeshInstance3D: mesh.material_overlay=flash_material if flash>0 else null
 	var blend := 1-exp(-delta*20)
 	body.position=body.position.lerp(Vector3.ZERO,blend)
 	body.rotation.y=lerp_angle(body.rotation.y,0,blend)
@@ -85,167 +125,130 @@ func _process(delta: float) -> void:
 	world.art.animate_arm(rig,blade)
 
 func _physics_process(delta: float) -> void:
-	if not alive or not ai_enabled or (world.hit_stop>0 and not world.net.running):
-		return
-	var player: CharacterBody3D = world.player
+	if not alive or not ai_enabled or (world.hit_stop>0 and not world.net.running): return
+	combat.step(delta)
 	var nearest := INF
 	for candidate in world.net.combatants():
-		if candidate.alive and (candidate.active or world.net.running) and position.distance_to(candidate.position)<nearest:
-			player=candidate
+		if candidate.alive and candidate.active and position.distance_to(candidate.position)<nearest:
+			target_player=candidate
 			nearest=position.distance_to(candidate.position)
 	if nearest==INF: return
-	target_player=player
-	var offset := player.global_position - global_position
+	var offset: Vector3=target_player.position-position
 	var distance := offset.length()
-	cooldown = maxf(0, cooldown - delta)
-	stagger = maxf(0, stagger - delta)
-	guard_lock = maxf(0, guard_lock - delta)
-	swing_time = maxf(0, swing_time - delta)
-	flash = maxf(0, flash - delta)
-	stamina = minf(80, stamina + delta * 14)
-	bar.visible = distance < 13
-	bar.look_at(player.camera.global_position, Vector3.UP)
-	for mesh in body.get_children():
-		if mesh is MeshInstance3D:
-			mesh.material_overlay = flash_material if flash > 0 else null
-	if not is_on_floor():
-		velocity.y -= delta * 22
-	velocity.x = 0
-	velocity.z = 0
-	blocking = false
-	if distance < (17 if boss else 13):
-		if distance > 0.1 and not attacking and swing_time == 0:
-			look_at(Vector3(player.global_position.x, global_position.y, player.global_position.z), Vector3.UP)
-		if stagger > 0:
-			attacking = false
-		elif attacking:
-			update_attack(delta, distance)
-		elif swing_time > 0:
-			pass
-		elif guard_lock > 0 and stamina >= 15:
-			blocking = true
-		elif player.winding and distance < 3.8 and stamina >= 15:
-			reaction += delta
-			if reaction >= (0.18 if boss else 0.24):
-				guard_direction = Combat.incoming(player.attack_direction) if world.rng.randf() < (0.9 if boss else 0.75) else world.rng.randi_range(0, 3)
-				guard_lock = 0.8
-				blocking = true
-		elif distance > 2.1:
-			reaction = 0
-			var direction := offset.normalized()
-			velocity.x = direction.x * (2.6 if boss else 2.2)
-			velocity.z = direction.z * (2.6 if boss else 2.2)
-		elif cooldown == 0 and stamina >= 20:
-			reaction = 0
-			begin_attack()
+	var cap: float=combat.turn_cap()
+	if distance>0.1: rotation.y=rotate_toward(rotation.y,atan2(-offset.x,-offset.z),(cap if cap>0 else 8.0)*delta)
+	attack_pause=maxf(0,attack_pause-delta)
+	if distance<(17 if boss else 13):
+		think_combat(delta,distance)
 	else:
-		attacking = false
-		guard_lock = 0
-		var offset_home := home - global_position
-		if offset_home.length() > 0.7:
-			velocity.x = offset_home.normalized().x * 1.5
-			velocity.z = offset_home.normalized().z * 1.5
-	velocity += knockback
+		combat.stop_block()
+	var direction := Vector3.ZERO
+	if distance<(17 if boss else 13):
+		if distance>2.0: direction=offset.normalized()
+		elif distance<1.3: direction=-offset.normalized()*0.6
+		else:
+			strafe_clock-=delta
+			if strafe_clock<=0:
+				strafe_clock=world.rng.randf_range(1.2,3)
+				strafe_sign=[-1.0,0.0,1.0][world.rng.randi_range(0,2)]
+			direction=offset.normalized().cross(Vector3.UP)*strafe_sign*0.35
+	elif position.distance_to(home)>0.7: direction=(home-position).normalized()*0.5
+	var speed: float=(2.6 if boss else 2.2)*combat.move_multiplier()
+	velocity.x=direction.x*speed+knockback.x
+	velocity.z=direction.z*speed+knockback.z
+	if not is_on_floor(): velocity.y-=22*delta
 	move_and_slide()
-	knockback = knockback.move_toward(Vector3.ZERO, delta * 16)
-	body.position.y = sin(Time.get_ticks_msec() * 0.008) * 0.025 if velocity.length() > 0.5 else 0.0
-	for i in legs.size():
-		legs[i].rotation.x = sin(Time.get_ticks_msec()*0.008+i*PI)*0.38 if velocity.length()>0.5 else lerpf(legs[i].rotation.x,0,delta*8)
-	body.rotation.z = sin(flash * 15) * 0.15
-	marker.visible = attacking and feint_gap == 0
-	direction_label.visible = distance < 15 and (attacking or blocking)
-	if attacking:
-		var incoming := Combat.incoming(attack_direction)
-		direction_label.text = "FINTE" if feint_gap > 0 else Combat.ARROWS[incoming] + " " + Combat.NAMES[incoming]
-		direction_label.modulate = Color("efbc6d")
-		blade.rotation = blade.rotation.lerp(Combat.pose(attack_direction), minf(1, delta * 14))
-	elif blocking:
-		direction_label.text = "BLOCK " + Combat.NAMES[Combat.incoming(guard_direction)]
-		direction_label.modulate = Color("80cee3")
-		blade.rotation = blade.rotation.lerp(Combat.pose(guard_direction, true), minf(1, delta * 16))
-	elif swing_time > 0:
-		blade.rotation = Combat.pose(attack_direction).lerp(Vector3(1.1, 0, 0.8), 1.0 - swing_time / 0.3)
-		if attack_direction == Combat.Direction.THRUST:
-			blade.rotation = Combat.pose(attack_direction)
-	var blade_pos := Vector3(0.47, 0.85, -0.25)
-	if attacking or swing_time > 0:
-		blade_pos = Vector3(-0.5 if attack_direction == 0 else 0.5, 1.85 if attack_direction == 1 else 1.15, -0.25)
-		if attack_direction == 1 and swing_time > 0:
-			blade_pos.y -= (1.0 - swing_time / 0.3) * 0.9
-	elif blocking:
-		blade_pos = Vector3(-0.45 if guard_direction == 0 else (0.45 if guard_direction == 2 else 0.0), 1.95 if guard_direction == 1 else 1.15, -0.4)
-	blade.position = blade.position.lerp(blade_pos, minf(1, delta * 16))
-	blade.position.z = -0.25 - (sin((1.0 - swing_time / 0.3) * PI) * 0.6 if swing_time > 0 and attack_direction == Combat.Direction.THRUST else 0.0)
-	if not attacking and not blocking and swing_time == 0:
-		blade.rotation = blade.rotation.lerp(Vector3.ZERO, minf(1, delta * 8))
-
+	knockback=knockback.move_toward(Vector3.ZERO,delta*16)
+	flash=maxf(0,flash-delta)
+	for mesh in body.get_children():
+		if mesh is MeshInstance3D: mesh.material_overlay=flash_material if flash>0 else null
+	for i in legs.size(): legs[i].rotation.x=sin(Time.get_ticks_msec()*0.008+i*PI)*0.38 if direction.length()>0.1 else lerpf(legs[i].rotation.x,0,delta*8)
+	combat.sync_view()
+	bar.scale.x=maxf(0.01,health/combat.max_health)
+	bar.visible=distance<13
+	marker.visible=attacking
+	direction_label.visible=distance<15 and (attacking or blocking or swing_time>0)
+	direction_label.text="BLOCK "+Combat.NAMES[Combat.incoming(guard_direction)] if blocking else Combat.ARROWS[Combat.incoming(attack_direction)]
+	direction_label.modulate=Color("80cee3") if blocking else Color("efbc6d")
 	world.art.animate_arm(rig,blade)
 
+func think_combat(delta: float, distance: float) -> void:
+	var threat: bool=target_player.combat.is_attacking() and distance<4
+	if threat:
+		if not reacting:
+			reacting=true
+			parry_attempted=false
+			reaction=0.2 if boss else 0.35
+			block_choice=Combat.incoming(target_player.attack_direction) if world.rng.randf()<(0.8 if boss else 0.4) else world.rng.randi_range(0,3)
+			guard_lock=world.rng.randf_range(0.4,0.8)
+		reaction-=delta
+		if reaction<=0 and combat.state in [MeleeCombat.State.IDLE,MeleeCombat.State.WINDUP]:
+			combat.start_block(Combat.to_melee(block_choice))
+		if not parry_attempted and target_player.combat.state==MeleeCombat.State.SWING and target_player.combat.blade_distance_to(combat)<0.7:
+			parry_attempted=true
+			if combat.state==MeleeCombat.State.BLOCK and world.rng.randf()<(0.4 if boss else 0.08): combat.refresh_block()
+	elif reacting:
+		reacting=false
+		guard_lock=0.2
+	if not reacting and guard_lock>0:
+		guard_lock-=delta
+		if guard_lock<=0: combat.stop_block()
+	if combat.state==MeleeCombat.State.WINDUP:
+		hold_time-=delta
+		if hold_time<=0:
+			if will_feint:
+				will_feint=false
+				feinted=true
+				combat.feint_to(MeleeCombat.next_dir(combat.attack_dir))
+				hold_time=0.45
+			else: combat.release_attack()
+	elif combat.state==MeleeCombat.State.IDLE and attack_pause==0 and distance<2.5 and not reacting:
+		var active_attackers := 0
+		for other in world.net.enemies_in_world():
+			if other!=self and other.combat.is_attacking(): active_attackers+=1
+		if active_attackers<2: begin_attack()
+
 func begin_attack() -> void:
-	attacking = true
-	stamina -= 20
-	attack_direction = world.rng.randi_range(0, 3)
-	windup = 0.72 if boss else 0.9
-	attack_elapsed = 0
-	feinted = false
-	feint_gap = 0
-	will_feint = stamina >= 8 and world.rng.randf() < (0.4 if boss else 0.2)
+	var direction: int = world.rng.randi_range(0,3)
+	if is_instance_valid(target_player) and target_player.blocking and world.rng.randf()<(0.75 if boss else 0.3):
+		while Combat.incoming(direction)==target_player.guard_direction: direction=world.rng.randi_range(0,3)
+	if combat.start_windup(Combat.to_melee(direction)):
+		hold_time=world.rng.randf_range(0.4,1.1)
+		will_feint=world.rng.randf()<(0.3 if boss else 0.08)
+		feinted=false
+		attack_pause=hold_time+world.rng.randf_range(0.8,1.8)
+		combat.sync_view()
 
-func update_attack(delta: float, distance: float) -> void:
-	attack_elapsed += delta
-	if feint_gap > 0:
-		feint_gap = maxf(0, feint_gap - delta)
-		return
-	windup -= delta
-	if will_feint and not feinted and attack_elapsed >= 0.3:
-		feinted = true
-		stamina -= 8
-		attack_direction = (attack_direction + world.rng.randi_range(1, 3)) % 4
-		windup = 0.52
-		feint_gap = 0.16
-		return
-	if windup <= 0:
-		attacking = false
-		swing_time = 0.3
-		cooldown = 1.1 if boss else 1.45
-		world.sword_sound()
-		var facing := -global_transform.basis.z
-		var offset: Vector3 = (target_player if is_instance_valid(target_player) else world.player).global_position - global_position
-		if distance < 2.8 and facing.dot(offset.normalized()) > 0.45 and world.clear_line(global_position + Vector3.UP, (target_player if is_instance_valid(target_player) else world.player).global_position + Vector3.UP, [get_rid(), (target_player if is_instance_valid(target_player) else world.player).get_rid()]):
-			(target_player if is_instance_valid(target_player) else world.player).take_damage(26 if boss else 17, global_position, Combat.incoming(attack_direction))
-
-func receive_attack(amount: float, direction: int, source: Vector3, attacker: Node3D = null) -> bool:
+func receive_attack(amount: float, direction: int, _source: Vector3, attacker: Node3D = null) -> bool:
 	if attacker==null: attacker=world.player
-	if not alive:
-		return false
-	var toward := (source - global_position).normalized()
-	if blocking and guard_direction == Combat.incoming(direction) and stamina >= 15 and (-global_transform.basis.z).dot(toward) > 0.2:
-		stamina -= 15
-		attacker.recoil = 1.0
-		attacker.shake = 0.4
-		attacker.cooldown = maxf(attacker.cooldown, 0.58)
-		attacker.feedback("GEGNER BLOCKT · Finte + Richtungswechsel", "block")
-		world.impact(global_position + Vector3(0, 1.3, 0), true)
-		return false
-	take_damage(amount)
-	knockback = -toward * 2.5
-	attacker.shake = 0.35
-	attacker.feedback("TREFFER · %d" % int(amount), "hit")
-	world.impact(global_position + Vector3(0, 1.2, 0), false)
-	return true
+	var result: int=combat.receive_attack(attacker.combat,Combat.to_melee(direction),amount)
+	combat.sync_view()
+	return result in [MeleeCombat.Result.HIT,MeleeCombat.Result.GUARD_BREAK]
 
 func take_damage(amount: float) -> void:
 	if not alive:
 		return
-	health -= amount
-	flash = 0.2
-	stagger = 0.3
-	attacking = false
-	blocking = false
-	guard_lock = 0
-	cooldown = maxf(cooldown, 0.5)
-	bar.scale.x = maxf(0.01, health / (180.0 if boss else 85.0))
-	if health <= 0:
+	combat._take_damage(amount)
+	if alive: combat._stagger(combat.profile.flinch_time)
+	flash=0.2
+	bar.scale.x=maxf(0.01,health/combat.max_health)
+
+func play_hit_reaction(direction: int, strength: float) -> void:
+	if hit_tween: hit_tween.kill()
+	var base_scale := Vector3.ONE*(1.12 if boss else 1.0)
+	var tilt := -0.15 if direction==MeleeCombat.Dir.OVERHEAD else (0.18 if direction==MeleeCombat.Dir.THRUST else 0.0)
+	var roll := 0.15 if direction==MeleeCombat.Dir.LEFT else (-0.15 if direction==MeleeCombat.Dir.RIGHT else 0.0)
+	hit_tween=create_tween().set_parallel()
+	hit_tween.tween_property(body,"rotation:x",tilt*strength,0.05)
+	hit_tween.tween_property(body,"rotation:z",roll*strength,0.05)
+	hit_tween.tween_property(body,"scale",base_scale*Vector3(1.03,0.94,1.03),0.05)
+	hit_tween.chain().tween_property(body,"rotation:x",0.0,0.4)
+	hit_tween.parallel().tween_property(body,"rotation:z",0.0,0.4)
+	hit_tween.parallel().tween_property(body,"scale",base_scale,0.4)
+
+func combat_death() -> void:
+	if alive:
+		if hit_tween: hit_tween.kill()
 		alive = false
 		for mesh in body.get_children():
 			if mesh is MeshInstance3D:

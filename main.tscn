@@ -1,7 +1,6 @@
-[gd_scene load_steps=2 format=3]
+[gd_scene format=3 uid="uid://do1g4uhubwn4u"]
 
-[ext_resource type="Script" path="res://scripts/world.gd" id="1"]
+[ext_resource type="Script" uid="uid://g0k1i54qgc5c" path="res://scripts/world.gd" id="1"]
 
-[node name="Aschenmark" type="Node3D"]
+[node name="Aschenmark" type="Node3D" unique_id=1271482681]
 script = ExtResource("1")
-

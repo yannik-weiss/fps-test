@@ -456,7 +456,7 @@ func build_ui() -> void:
 	lan_button.text = "LAN · Runde eröffnen / beitreten"
 	lan_button.pressed.connect(func(): net.open_lobby())
 	menu_box.add_child(lan_button)
-	var help := label("WASD · Bewegung     Maus · Blick     E · Interaktion\nMaus / 1–4 · Links / Oben / Rechts / Stich\nLinksklick halten / lösen · Angriff   Rechts halten · Block\nQ · Finte während des Ausholens\nShift · Sprint     Leertaste · Sprung     J · Tagebuch\n\nEinzelspieler oder LAN PvPvE · ohne Speicherstand", 14, Color("a7b0a5"))
+	var help := label("WASD · Bewegung     Maus · Blick     E · Interaktion\nMaus / 1–4 · Links / Oben / Rechts / Stich\nLinksklick halten / lösen · Angriff   Rechts halten · Block\nQ · Richtungsfinte während des Ausholens\nShift · Sprint     Leertaste · Sprung     J · Tagebuch\n\nEinzelspieler oder LAN PvPvE · ohne Speicherstand", 14, Color("a7b0a5"))
 	help.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	menu_box.add_child(help)
 	journal = PanelContainer.new()
@@ -465,7 +465,7 @@ func build_ui() -> void:
 	journal.size = Vector2(640, 460)
 	journal.add_theme_stylebox_override("panel", panel_style(Color(0.06, 0.09, 0.09, 0.97)))
 	layer.add_child(journal)
-	var journal_text := label("REISETAGEBUCH\n\nDer letzte Wächter\n\nFolge dem Pfad nach Norden zur alten Abtei.\nIhre Besatzer tragen Gold; ihr Wächter trägt das Siegel.\nBringe es zum Lagerfeuer zurück.\n\nEine bessere Klinge\n\nSammle zweimal Holz und zweimal Erz am Wegesrand.\nAn der Schmiede neben dem Feuer kannst du deine\nKlinge verstärken. Das Lagerfeuer heilt dich.\n\nIm Kampf\n\nGoldener Pfeil: gegnerische Angriffsrichtung.\nBlocke auf der angezeigten Seite (inklusive Stich).\nMaus / 1–4: Links, Oben, Rechts, Stich.\nLinksklick halten / lösen: Ausholen und Zuschlagen.\nQ beim Ausholen: Finte, dann Richtung wechseln.\nBlau: Gegner blockt. Finten täuschen seinen Block.\nEine frische Parade spart Ausdauer.\n\nJ / Esc · Tagebuch schließen", 18)
+	var journal_text := label("REISETAGEBUCH\n\nDer letzte Wächter\n\nFolge dem Pfad nach Norden zur alten Abtei.\nIhre Besatzer tragen Gold; ihr Wächter trägt das Siegel.\nBringe es zum Lagerfeuer zurück.\n\nEine bessere Klinge\n\nSammle zweimal Holz und zweimal Erz am Wegesrand.\nAn der Schmiede neben dem Feuer kannst du deine\nKlinge verstärken. Das Lagerfeuer heilt dich.\n\nIm Kampf\n\nGoldener Pfeil: gegnerische Angriffsrichtung.\nBlocke auf der angezeigten Seite (inklusive Stich).\nMaus / 1–4: Links, Oben, Rechts, Stich.\nLinksklick halten / lösen: Ausholen und Zuschlagen.\nQ beim Ausholen: in neue Richtung fintieren.\nBlau: Gegner blockt. Finten täuschen seinen Block.\nFrische Parade: Gegner taumelt. Deckung kostet Ausdauer.\n\nJ / Esc · Tagebuch schließen", 18)
 	journal.add_child(journal_text)
 	journal.visible = false
 
@@ -505,7 +505,7 @@ func _process(delta: float) -> void:
 	combat_label.visible = combat_time > 0
 	for index in range(4):
 		direction_labels[index].modulate = (Color("82dcf1") if player.blocking else Color("efbd6f")) if index == player.selected_direction else Color(0.8, 0.85, 0.8, 0.55)
-	stance_label.text = ("BLOCK " if player.blocking else ("AUSHOLEN " if player.winding else "RICHTUNG ")) + PlayerScript.Combat.NAMES[player.guard_direction if player.blocking else (player.attack_direction if player.winding else player.selected_direction)]
+	stance_label.text = ("BLOCK " if player.blocking else ("AUFLADEN %d%% " % int(player.combat.charge()*100) if player.winding else ("ERHOLUNG " if player.cooldown>0 else "RICHTUNG "))) + PlayerScript.Combat.NAMES[player.guard_direction if player.blocking else (player.attack_direction if player.winding else player.selected_direction)]
 	hit_flash = maxf(0, hit_flash - delta)
 	crosshair.modulate = Color("e8b978") if hit_flash > 0 else Color.WHITE
 	damage_overlay.color.a = player.hurt_time * 0.65

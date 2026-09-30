@@ -62,25 +62,35 @@ func run() -> void:
 	remote.stamina=100
 	client_world.net.command("attack",1)
 	client_world.net.command("release",1)
-	await create_timer(0.45).timeout
-	check(host_world.player.health==72,"Network attack damages another player outside camp")
-	check(client_world.net.actors[1].health==72,"PvP health change replicates to client")
-	# The server decides directional block outcomes, independent of client damage claims.
-	host_world.player.blocking=true
-	host_world.player.guard_direction=1
-	host_world.player.stamina=100
-	host_world.player.block_age=1
+	await create_timer(1.3).timeout
+	check(host_world.player.health<74 and host_world.player.health>70,"Network attack damages another player outside camp")
+	check(is_equal_approx(client_world.net.actors[1].health,host_world.player.health),"PvP health change replicates to client")
+	# Server-resolved guard contacts are replayed once, alongside ordered health.
+	remote.combat.reset()
+	host_world.player.combat.reset()
 	host_world.player.rotation.y=PI
-	remote.attack_direction=1
-	host_world.net.resolve_attack(remote)
-	check(host_world.player.health==72,"Correct PvP directional block prevents damage")
-	host_world.player.guard_direction=0
-	host_world.net.resolve_attack(remote)
-	check(host_world.player.health==44,"Wrong PvP block direction takes damage")
+	host_world.player.combat.start_block(MeleeCombat.Dir.OVERHEAD)
+	host_world.player.combat._block_time=1
+	var hp: float=host_world.player.health
+	var result: int=host_world.player.combat.decide_defense(remote.combat,MeleeCombat.Dir.OVERHEAD,28)
+	remote.combat.attack_dir=MeleeCombat.Dir.OVERHEAD
+	host_world.net.broadcast_contact(remote.combat,host_world.player.combat,result,true,host_world.player.position+Vector3.UP,28)
+	remote.combat.apply_contact(host_world.player.combat,result,true,host_world.player.position+Vector3.UP,28)
+	check(host_world.player.health==hp,"Correct PvP directional block prevents damage")
+	host_world.player.combat.reset()
+	host_world.player.combat.start_block(MeleeCombat.Dir.LEFT)
+	host_world.player.combat._block_time=1
+	result=host_world.player.combat.decide_defense(remote.combat,MeleeCombat.Dir.OVERHEAD,28)
+	client_world.net.actors[1].health=1 # Client has not yet received a server heal.
+	host_world.net.broadcast_contact(remote.combat,host_world.player.combat,result,false,host_world.player.position+Vector3.UP,28)
+	remote.combat.apply_contact(host_world.player.combat,result,false,host_world.player.position+Vector3.UP,28)
+	check(host_world.player.health==72,"Wrong PvP block direction takes damage")
+	await create_timer(0.2).timeout
+	check(client_world.net.actors[1].health==host_world.player.health,"Contact replay and health snapshot do not apply damage twice")
+	check(client_world.net.actors[1].alive,"Unreceived server heal does not cause false client death")
 	host_world.player.position=Vector3(0,0.1,10)
-	remote.position=Vector3(0,0.1,12.3)
-	host_world.net.resolve_attack(remote)
-	check(host_world.player.health==44,"Camp safe zone prevents PvP damage")
+	remote.position=Vector3(0,0.1,12)
+	check(not remote.combat._opponents().has(host_world.player.combat),"Camp safe zone excludes PvP contacts")
 	# Shared resource transaction via actual RPC; duplicate request cannot grant it twice.
 	remote.position=Vector3(-5,0.1,3)
 	remote.rotation=Vector3.ZERO
@@ -92,19 +102,16 @@ func run() -> void:
 	# PvE from a client with server-owned health and AI.
 	var enemy=host_world.net.enemies_in_world()[0]
 	enemy.position=Vector3(0,0.1,-14)
-	enemy.health=28
-	remote.position=Vector3(0,0.1,-11.7)
-	remote.cooldown=0
-	remote.stagger=0
-	remote.winding=false
-	remote.blocking=false
+	enemy.health=15
+	remote.position=Vector3(0,0.1,-12.1)
+	remote.combat.reset()
 	remote.stamina=100
 	remote.rotation=Vector3.ZERO
 	client_world.player.rotation=Vector3.ZERO
 	client_world.player.camera.rotation=Vector3.ZERO
 	client_world.net.command("attack",2)
 	client_world.net.command("release",2)
-	await create_timer(0.5).timeout
+	await create_timer(1.3).timeout
 	check(not enemy.alive,"Client attack defeats shared PvE enemy")
 	check(not client_world.net.enemies_in_world()[0].alive,"Enemy death replicates")
 	check(client_world.resources.size()==host_world.resources.size(),"Server loot exists on client")

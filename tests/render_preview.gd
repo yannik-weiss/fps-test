@@ -26,8 +26,10 @@ func capture() -> void:
 	enemy.ai_enabled = true
 	enemy.position = Vector3(0, 0.05, -17)
 	enemy.rotation.y = PI
-	enemy.begin_attack()
-	enemy.attack_direction = 1
+	enemy.combat.reset()
+	enemy.combat.start_windup(MeleeCombat.Dir.OVERHEAD)
+	enemy.combat.sync_view()
+	enemy.hold_time=1
 	enemy.will_feint = false
 	world.player.position = Vector3(0, 0.05, -14.5)
 	world.player.select_direction(1)

@@ -2,7 +2,7 @@ extends Node
 
 const PORT := 27841
 const DISCOVERY_PORT := 27842
-const VERSION := "aschenmark-lan-2"
+const VERSION := "aschenmark-lan-4"
 var world: Node3D
 var running := false
 var hosting := false
@@ -248,7 +248,7 @@ func broadcast_motion() -> void:
 	for id in actors:
 		var p = actors[id]
 		var flags := (1 if p.blocking else 0) | (2 if p.winding else 0)
-		receive_player_motion.rpc(snapshot_sequence,id,p.position,p.velocity,p.rotation.y,p.last_input_processed,p.stamina,p.guard_direction,p.attack_direction,flags,p.swing_time)
+		receive_player_motion.rpc(snapshot_sequence,id,p.position,p.velocity,p.rotation.y,p.last_input_processed,p.stamina,p.guard_direction,p.attack_direction,flags,p.swing_time,p.camera.rotation.x,p.sword.position,p.sword.rotation)
 	var enemies := enemies_in_world()
 	for i in enemies.size():
 		var e = enemies[i]
@@ -259,7 +259,7 @@ func broadcast_motion() -> void:
 # Each entity uses a small packet; changing world dictionaries cannot fragment
 # or queue movement behind reliable inventory/health transfers.
 @rpc("authority","call_remote","unreliable_ordered",5)
-func receive_player_motion(sequence: int, id: int, pos: Vector3, _velocity: Vector3, yaw: float, acknowledged: int, stamina: float, guard: int, attack: int, flags: int, swing: float) -> void:
+func receive_player_motion(sequence: int, id: int, pos: Vector3, _velocity: Vector3, yaw: float, acknowledged: int, stamina: float, guard: int, attack: int, flags: int, swing: float, pitch := 0.0, blade_pos := Vector3.ZERO, blade_rot := Vector3.ZERO) -> void:
 	if hosting or sequence<=motion_sequences.get(id,-1) or not actors.has(id): return
 	motion_sequences[id]=sequence
 	var p = actors[id]
@@ -279,6 +279,12 @@ func receive_player_motion(sequence: int, id: int, pos: Vector3, _velocity: Vect
 		p.guard_direction=guard
 		p.attack_direction=attack
 		p.swing_time=swing
+		p.net_pitch=pitch
+		p.net_blade_pos=blade_pos
+		p.net_blade_rot=blade_rot
+		p.combat.attack_dir=world.PlayerScript.Combat.to_melee(attack)
+		p.combat.block_dir=world.PlayerScript.Combat.to_melee(guard)
+		p.combat.state=MeleeCombat.State.BLOCK if bool(flags&1) else (MeleeCombat.State.WINDUP if bool(flags&2) else (MeleeCombat.State.SWING if swing>0 else MeleeCombat.State.IDLE))
 	p.stamina=stamina
 
 @rpc("authority","call_remote","unreliable_ordered",6)
@@ -304,6 +310,9 @@ func receive_enemy_motion(sequence: int, index: int, pos: Vector3, yaw: float, g
 	e.swing_time=swing
 	e.net_blade_pos=blade_pos
 	e.net_blade_rot=blade_rot
+	e.combat.attack_dir=world.PlayerScript.Combat.to_melee(attack)
+	e.combat.block_dir=world.PlayerScript.Combat.to_melee(guard)
+	e.combat.state=MeleeCombat.State.BLOCK if bool(flags&1) else (MeleeCombat.State.WINDUP if bool(flags&2) else (MeleeCombat.State.SWING if swing>0 else MeleeCombat.State.IDLE))
 	e.bar.visible=e.position.distance_to(world.player.position)<13
 	e.direction_label.visible=e.blocking or e.attacking
 	e.direction_label.text=("BLOCK "+world.PlayerScript.Combat.NAMES[world.PlayerScript.Combat.incoming(guard)]) if e.blocking else world.PlayerScript.Combat.ARROWS[world.PlayerScript.Combat.incoming(attack)]
@@ -444,23 +453,32 @@ func request_action(action: String, direction: int, yaw: float, pitch: float) ->
 	if not actors.has(id): return
 	if not is_finite(yaw) or not is_finite(pitch): return
 	var actor = actors[id]
-	actor.rotation.y=wrapf(yaw,-PI,PI)
+	# Apply the same look caps to remote fighters; movement frames carry their aim.
+	var cap: float=actor.combat.turn_cap()
+	actor.rotation.y=rotate_toward(actor.rotation.y,wrapf(yaw,-PI,PI),cap/30) if cap>0 else wrapf(yaw,-PI,PI)
 	actor.camera.rotation.x=clampf(pitch,-1.25,1.25)
 	match action:
 		"attack":
 			actor.select_direction(clampi(direction,0,3))
 			actor.attack(true)
-		"release": actor.release_requested=true
-		"feint": actor.feint()
+		"release": actor.combat.queue_release()
+		"feint": actor.combat.feint_or_redirect(world.PlayerScript.Combat.to_melee(clampi(direction,0,3)))
+		"block":
+			actor.block_held=true
+			actor.combat.queue_block(world.PlayerScript.Combat.to_melee(clampi(direction,0,3)))
+		"unblock":
+			actor.block_held=false
+			actor.combat.queue_block_release()
 		"interact": interact_as(actor)
 		"respawn": respawn(actor)
 
 func respawn(actor: Node3D) -> void:
 	if actor.alive: return
+	actor.combat.reset()
 	actor.health=100
 	actor.stamina=100
-	actor.collision_layer=1
-	actor.collision_mask=1
+	actor.collision_layer=2
+	actor.collision_mask=3
 	actor.alive=true
 	actor.active=true
 	actor.position=Vector3(0,0.1,13)
@@ -478,27 +496,49 @@ func safe_zone(pos: Vector3) -> bool:
 func combatants() -> Array:
 	return actors.values() if running else [world.player]
 
-func resolve_attack(attacker: Node3D) -> void:
-	var candidates: Array = enemies_in_world()
-	candidates.append_array(actors.values())
-	var target: Node3D = null
-	var nearest := 3.5 if attacker.attack_direction==3 else 3.1
-	var origin: Vector3=attacker.camera.global_position
-	var forward: Vector3=-attacker.camera.global_transform.basis.z
-	for candidate in candidates:
-		if candidate==attacker or not candidate.alive: continue
-		if candidate in actors.values() and (safe_zone(candidate.position) or safe_zone(attacker.position)): continue
-		var offset: Vector3=candidate.position+Vector3.UP-origin
-		if offset.length()<nearest and forward.dot(offset.normalized())>(0.86 if attacker.attack_direction==3 else 0.64) and world.clear_line(origin,candidate.position+Vector3.UP,[attacker.get_rid(),candidate.get_rid()]):
-			nearest=offset.length()
-			target=candidate
-	if target:
-		var old_health: float=target.health
-		if target in actors.values(): target.take_damage(28 if attacker.weapon_level==1 else 45,attacker.position,world.PlayerScript.Combat.incoming(attacker.attack_direction))
-		else: target.receive_attack(28 if attacker.weapon_level==1 else 45,attacker.attack_direction,attacker.position,attacker)
-		if target in actors.values():
-			attacker.feedback("TREFFER" if target.health<old_health else "GEGNER BLOCKT","hit" if target.health<old_health else "block")
-	else: attacker.feedback("VERFEHLT","miss")
+func fighter_id(actor: Node3D) -> int:
+	if actor.has_method("attack"): return actor.peer_id
+	return -enemies_in_world().find(actor)-1
+
+func fighter_actor(id: int):
+	if id>0: return actors.get(id)
+	var enemies := enemies_in_world()
+	var index := -id-1
+	return enemies[index] if index>=0 and index<enemies.size() else null
+
+
+func broadcast_contact(attacker: MeleeCombat, target: MeleeCombat, result: int, blade_contact: bool, point: Vector3, damage: float) -> void:
+	receive_contact.rpc(fighter_id(attacker.body),fighter_id(target.body),result,int(attacker.attack_dir),attacker.last_swing_charge,blade_contact,point,damage,target.health,target.stamina,int(target.state))
+
+# Contacts and authoritative health snapshots share the reliable channel so a
+# replay can never subtract damage from a health snapshot that already includes it.
+@rpc("authority","call_remote","reliable",3)
+func receive_contact(attacker_id: int, target_id: int, result: int, direction: int, charge: float, blade_contact: bool, point: Vector3, damage: float, target_health := -1.0, target_stamina := -1.0, target_state := -1) -> void:
+	if hosting: return
+	var attacker=fighter_actor(attacker_id)
+	var target=fighter_actor(target_id)
+	if not is_instance_valid(attacker) or not is_instance_valid(target): return
+	# Include the defender's pre-contact stats: a campfire heal may have happened
+	# since the last periodic snapshot. This prevents a false predicted death.
+	if target_health>=0: target.health=target_health
+	if target_stamina>=0: target.stamina=target_stamina
+	if target_state>=0: target.combat.state=target_state
+	if target_health>0 and not target.alive:
+		target.alive=true
+		target.collision_layer=2
+		target.collision_mask=3
+		if target==world.player: world.start_or_resume()
+	attacker.combat.attack_dir=direction
+	attacker.combat.last_swing_charge=charge
+	attacker.combat.apply_contact(target.combat,result,blade_contact,point,damage)
+	attacker.combat.sync_view()
+	target.combat.sync_view()
+
+@rpc("authority","call_remote","reliable",3)
+func receive_world_contact(attacker_id: int, point: Vector3) -> void:
+	if hosting: return
+	var attacker=fighter_actor(attacker_id)
+	if is_instance_valid(attacker): attacker.combat.apply_world_hit(point)
 
 func interact_as(actor: Node3D) -> void:
 	if not actor.alive: return
@@ -585,8 +625,9 @@ func receive_snapshot(sequence: int, players: Dictionary, enemies: Array, items:
 		var was_alive: bool=p.alive
 		p.health=data.hp
 		p.alive=data.alive
-		p.collision_layer=1 if p.alive else 0
-		p.collision_mask=1 if p.alive else 0
+		if not p.alive: p.combat.state=MeleeCombat.State.DEAD
+		p.collision_layer=2 if p.alive else 0
+		p.collision_mask=3 if p.alive else 0
 		p.weapon_level=data.weapon
 		p.display_name=data.name
 		p.wood=data.wood
@@ -594,6 +635,7 @@ func receive_snapshot(sequence: int, players: Dictionary, enemies: Array, items:
 		p.gold=data.gold
 		if id==my_id and was_alive and not p.alive: world.on_death()
 		if id==my_id and not was_alive and p.alive:
+			p.combat.reset()
 			p.position=data.pos
 			p.velocity=Vector3.ZERO
 			p.camera_correction=Vector3.ZERO
@@ -609,8 +651,8 @@ func receive_snapshot(sequence: int, players: Dictionary, enemies: Array, items:
 		var e=nodes[i]
 		var d: Dictionary=enemies[i]
 		if not e.alive and d.alive:
-			e.collision_layer=1
-			e.collision_mask=1
+			e.collision_layer=2
+			e.collision_mask=3
 			e.body.rotation=Vector3.ZERO
 			e.body.position=Vector3.ZERO
 		if e.alive and not d.alive:
@@ -623,6 +665,7 @@ func receive_snapshot(sequence: int, players: Dictionary, enemies: Array, items:
 			e.net_blade_rot=d.blade_rot
 		e.health=d.hp
 		e.alive=d.alive
+		if not e.alive: e.combat.state=MeleeCombat.State.DEAD
 		e.bar.scale.x=maxf(0.01,e.health/(180.0 if e.boss else 85.0))
 		e.bar.visible=e.alive and e.position.distance_to(world.player.position)<13
 		e.direction_label.visible=e.alive and (e.blocking or e.attacking)

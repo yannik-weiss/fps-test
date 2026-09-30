@@ -203,12 +203,12 @@ func finish() -> void:
 		grass_instances.append(Transform3D(Basis.from_euler(Vector3(0,random.randf()*TAU,0)).scaled(Vector3.ONE*random.randf_range(0.25,0.7)),Vector3(x,terrain_height(x,z),z)))
 	instances(tool.commit(),grass_instances,grass)
 
-func sword(parent: Node3D, centered := true) -> void:
-	var offset := 0.0 if centered else 0.38
+func sword(parent: Node3D, _centered := true) -> void:
+	var offset := 0.47 # Blade spans +Y 0.12…0.95, matching MeleeCombat.
 	# A diamond cross-section gives the steel blade a ridge and two actual cutting edges.
 	var tool := SurfaceTool.new()
 	tool.begin(Mesh.PRIMITIVE_TRIANGLES)
-	var levels := [-0.35,0.24,0.40]
+	var levels := [-0.35,0.24,0.48]
 	var widths := [0.044,0.034,0.0]
 	for segment in range(2):
 		for face in range(4):
@@ -218,7 +218,8 @@ func sword(parent: Node3D, centered := true) -> void:
 				var p: Vector2 = ring[(face+corner.x)%4]*widths[level]
 				tool.add_vertex(Vector3(p.x,levels[level]+offset,p.y))
 	tool.generate_normals()
-	mesh(parent,tool.commit(),Vector3.ZERO,world.steel)
+	var blade_mesh := mesh(parent,tool.commit(),Vector3.ZERO,world.steel)
+	blade_mesh.name="Blade"
 	var guard: MeshInstance3D = world.cylinder(parent,0.022,0.016,0.26,Vector3(0,-0.37+offset,0),world.brass,12)
 	guard.rotation.z = PI/2
 	world.cylinder(parent,0.028,0.023,0.21,Vector3(0,-0.49+offset,0),world.leather,12)
@@ -266,7 +267,7 @@ func update_limb(node: MeshInstance3D, start: Vector3, end: Vector3) -> void:
 	node.basis = Basis(right,axis,right.cross(axis)).orthonormalized()
 
 func animate_arm(rig: Dictionary, weapon: Node3D) -> void:
-	var hand: Vector3 = weapon.position + weapon.basis*Vector3(0,-0.11,0)
+	var hand: Vector3 = rig.hand.get_parent().to_local(weapon.to_global(Vector3(0,-0.02,0)))
 	var shoulder := Vector3(0.35,1.32,0)
 	var elbow := shoulder.lerp(hand,0.52)+Vector3(0.17,0,0.12)
 	update_limb(rig.upper,shoulder,elbow)

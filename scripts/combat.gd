@@ -12,3 +12,10 @@ static func pose(direction: int, guard := false) -> Vector3:
 	if guard:
 		return [Vector3(0.1, -0.25, -0.55), Vector3(0.1, 0, -PI / 2), Vector3(0.1, 0.25, 0.55), Vector3(-0.65, 0, -0.9)][direction]
 	return [Vector3(-0.4, -0.7, 1.25), Vector3(-0.6, 0, -0.1), Vector3(-0.4, 0.7, -1.25), Vector3(-PI / 2, 0, 0)][direction]
+
+# Aschenmark keeps its established 1–4 controls; the imported core uses O/T/L/R.
+static func to_melee(direction: int) -> int:
+	return [2,0,3,1][clampi(direction,0,3)]
+
+static func from_melee(direction: int) -> int:
+	return [1,3,0,2][clampi(direction,0,3)]

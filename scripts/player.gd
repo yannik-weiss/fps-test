@@ -4,8 +4,20 @@ const Combat = preload("res://scripts/combat.gd")
 
 signal stats_changed
 
-var health := 100.0
-var stamina := 100.0
+const Fighter = preload("res://scripts/fighter.gd")
+var combat
+var _health := 100.0
+var _stamina := 100.0
+var health: float:
+	get: return combat.health if is_instance_valid(combat) else _health
+	set(value):
+		_health=value
+		if is_instance_valid(combat): combat.health=value
+var stamina: float:
+	get: return combat.stamina if is_instance_valid(combat) else _stamina
+	set(value):
+		_stamina=value
+		if is_instance_valid(combat): combat.stamina=value
 var weapon_level := 1
 var alive := true
 var active := false
@@ -16,6 +28,8 @@ var hurt_time := 0.0
 var step_time := 0.0
 var camera: Camera3D
 var sword: Node3D
+var weapon_hand: MeshInstance3D
+var weapon_forearm: MeshInstance3D
 var world: Node3D
 var attack_direction := Combat.Direction.TOP
 var selected_direction := Combat.Direction.TOP
@@ -44,6 +58,12 @@ var last_input_received := 0
 var last_input_processed := 0
 var camera_correction := Vector3.ZERO
 var motion_credit := 0.0
+var pending_look := Vector2.ZERO
+var aim_travel := Vector2.ZERO
+var block_held := false
+var net_blade_pos := Vector3(0.3,-0.35,-0.45)
+var net_blade_rot := Vector3(-PI/18,0,0)
+var net_pitch := 0.0
 var avatar: Node3D
 var avatar_sword: Node3D
 var avatar_rig: Dictionary
@@ -51,7 +71,10 @@ var nameplate: Label3D
 
 func _ready() -> void:
 	world = get_parent()
+	collision_layer=2
+	collision_mask=3
 	var shape := CollisionShape3D.new()
+	shape.name="CollisionShape3D"
 	var capsule := CapsuleShape3D.new()
 	capsule.radius = 0.35
 	capsule.height = 1.8
@@ -69,6 +92,11 @@ func _ready() -> void:
 	world.art.sword(sword)
 	sword.position = Vector3(0.42, -0.31, -0.65)
 	sword.rotation = Vector3(-0.25, 0, -0.22)
+	if local_control:
+		weapon_hand=world.art.ellipsoid(camera,Vector3.ZERO,Vector3(0.055,0.045,0.055),world.leather)
+		weapon_forearm=world.art.limb(camera,Vector3(0.42,-0.52,0.04),Vector3(0.3,-0.35,-0.45),0.042,world.leather)
+		weapon_hand.cast_shadow=GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		weapon_forearm.cast_shadow=GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	if not local_control:
 		camera.current = false
 		sword.hide()
@@ -84,18 +112,39 @@ func _ready() -> void:
 		nameplate.font_size = 26
 		nameplate.pixel_size = 0.003
 		add_child(nameplate)
+	combat=Fighter.new()
+	combat.name="MeleeCombat"
+	combat.profile=preload("res://combat/sword_profile.tres")
+	combat.weapon=sword
+	combat.hitbox_scale=2.5
+	combat.base_damage=28
+	add_child(combat)
+	combat.swing_started.connect(func(_dir):
+		world.sword_sound()
+		if local_control: recoil=0.2)
 	stats_changed.emit()
 
 func _process(delta: float) -> void:
-	if local_control or not is_instance_valid(avatar): return
+	if local_control:
+		apply_look(delta)
+		if is_instance_valid(weapon_hand):
+			var grip: Vector3=sword.transform*Vector3(0,-0.02,0)
+			weapon_hand.position=grip
+			weapon_hand.rotation=sword.rotation
+			world.art.update_limb(weapon_forearm,Vector3(0.42,-0.52,0.04),grip)
+		return
+	if not is_instance_valid(avatar): return
 	avatar.visible = alive
 	avatar.position=avatar.position.lerp(Vector3.ZERO,1-exp(-delta*20))
 	avatar.rotation.y=lerp_angle(avatar.rotation.y,0,1-exp(-delta*20))
 	nameplate.text = display_name + (" · BLOCK " + Combat.NAMES[Combat.incoming(guard_direction)] if blocking else "")
-	avatar_sword.position = Vector3(0.43,1.9 if (winding and attack_direction==1) or (blocking and guard_direction==1) else 1.05,-0.25)
-	var pose := Combat.pose(guard_direction,true) if blocking else (Combat.pose(attack_direction) if winding else Vector3.ZERO)
-	if swing_time>0: pose=Combat.pose(attack_direction).lerp(Vector3(1.1,0,0.8),1-swing_time/0.3)
-	avatar_sword.rotation=avatar_sword.rotation.lerp(pose,minf(1,delta*16))
+	if world.net.running and not world.net.hosting:
+		var blend := 1-exp(-delta*20)
+		sword.position=sword.position.lerp(net_blade_pos,blend)
+		sword.rotation=sword.rotation.lerp(net_blade_rot,blend)
+		camera.rotation.x=lerpf(camera.rotation.x,net_pitch,blend)
+	avatar_sword.transform=camera.transform*sword.transform
+	avatar_sword.scale*=Vector3(1,combat.hitbox_scale,1)
 	world.art.animate_arm(avatar_rig,avatar_sword)
 
 func feedback(text: String, kind: String) -> void:
@@ -106,32 +155,39 @@ func _unhandled_input(event: InputEvent) -> void:
 	if not local_control or not active or not alive:
 		return
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-		if event.relative.length() > 3:
-			if absf(event.relative.y) > absf(event.relative.x) and event.relative.y < -3:
-				select_direction(Combat.Direction.TOP)
-			elif event.relative.y > 3 and absf(event.relative.y) > absf(event.relative.x):
-				select_direction(Combat.Direction.THRUST)
-			elif absf(event.relative.x) > absf(event.relative.y):
-				select_direction(Combat.Direction.LEFT if event.relative.x < 0 else Combat.Direction.RIGHT)
-		var sensitivity := 0.0009 if Input.is_action_pressed("block") else 0.0024
-		rotate_y(-event.relative.x * sensitivity)
-		camera.rotation.x = clampf(camera.rotation.x - event.relative.y * sensitivity, -1.25, 1.25)
+		aim_travel+=event.relative
+		if aim_travel.length()>6:
+			if absf(aim_travel.y)>absf(aim_travel.x): select_direction(1 if aim_travel.y<0 else 3)
+			else: select_direction(0 if aim_travel.x<0 else 2)
+			aim_travel=Vector2.ZERO
+		pending_look+=event.relative*0.0024
 	for index in range(4):
 		if event.is_action_pressed("direction_%d" % index):
 			select_direction(index)
 	if event.is_action_pressed("attack"):
 		attack(true)
 	if event.is_action_released("attack"):
-		release_requested = true
+		combat.queue_release()
 		world.net.command("release")
 	if event.is_action_pressed("feint"):
 		feint()
+	if event.is_action_pressed("block"):
+		block_held=true
+		combat.queue_block(Combat.to_melee(selected_direction))
+		world.net.command("block",selected_direction)
+	if event.is_action_released("block"):
+		block_held=false
+		combat.queue_block_release()
+		world.net.command("unblock")
 	if event.is_action_pressed("interact"):
 		world.interact()
 
 func select_direction(direction: int) -> void:
 	selected_direction = direction
-	guard_direction = direction
+	if not blocking: guard_direction = direction
+	if is_instance_valid(combat):
+		combat.update_queued_dir(Combat.to_melee(direction))
+		combat.aim_guard(Combat.to_melee(direction))
 
 func _physics_process(delta: float) -> void:
 	if not active or not alive:
@@ -152,21 +208,22 @@ func _physics_process(delta: float) -> void:
 		net_move=Vector2.ZERO
 		net_block=false
 		net_sprint=false
+		combat.hold_guard(false,Combat.to_melee(selected_direction))
+		block_held=false
 	if world.hit_stop > 0 and local_control and not world.net.running:
 		return
 	stagger = maxf(0, stagger - delta)
 	recoil = maxf(0, recoil - delta * 4)
 	shake = maxf(0, shake - delta * 2)
-	if winding:
-		windup += delta
-		if (release_requested and windup >= 0.34) or windup >= 0.8:
-			commit_attack()
-	cooldown = maxf(0, cooldown - delta)
-	swing_time = maxf(0, swing_time - delta)
-	hurt_time = maxf(0, hurt_time - delta)
-	var was_blocking := blocking
-	blocking = (Input.is_action_pressed("block") if local_control else net_block) and not winding and swing_time == 0 and stamina >= 15 and stagger == 0
-	block_age = block_age + delta if blocking and was_blocking else 0.0
+	hurt_time=maxf(0,hurt_time-delta)
+	combat.base_damage=28 if weapon_level==1 else 45
+	if local_control:
+		var held := Input.is_action_pressed("block")
+		if held and not block_held: combat.queue_block(Combat.to_melee(selected_direction))
+		elif not held and block_held: combat.queue_block_release()
+		block_held=held
+		combat.hold_guard(held,Combat.to_melee(selected_direction))
+	combat.step(delta)
 	var input := Input.get_vector("left", "right", "forward", "back") if local_control else net_move
 	var running := (Input.is_action_pressed("sprint") if local_control else net_sprint) and input.length()>0 and stamina>4 and not blocking
 	var jump := Input.is_action_just_pressed("jump") if local_control else net_jump
@@ -177,7 +234,6 @@ func _physics_process(delta: float) -> void:
 			if frame_sequence>0: last_input_processed=frame_sequence
 			while not input_queue.is_empty() and motion_credit>=delta:
 				last_input_processed=apply_input_frame(input_queue.pop_front())
-				blocking=net_block and not winding and swing_time==0 and stamina>=15 and stagger==0
 				input=net_move
 				running=net_sprint and input.length()>0 and stamina>4 and not blocking
 				simulate_movement(input,running,net_jump,delta)
@@ -189,40 +245,37 @@ func _physics_process(delta: float) -> void:
 	camera.position = Vector3(sin(Time.get_ticks_msec() * 0.07) * shake * 0.035, 1.6 + sin(step_time) * 0.035 * input.length() + cos(Time.get_ticks_msec() * 0.09) * shake * 0.025, 0)
 	camera.position += basis.inverse()*camera_correction
 	camera.fov = lerpf(camera.fov, 80 if running else 78, delta * 6)
-	var target_pos := Vector3(0.42, -0.31, -0.65)
-	var target_rot := Vector3(-0.25, 0, -0.22)
-	if blocking:
-		target_pos = Vector3(-0.2 if guard_direction == 0 else (0.2 if guard_direction == 2 else 0.0), 0.18 if guard_direction == 1 else -0.1, -0.5 + recoil * 0.12)
-		target_rot = Combat.pose(guard_direction, true)
-	elif winding:
-		target_pos = Vector3(-0.25 if attack_direction == 0 else 0.4, 0.42 if attack_direction == 1 else -0.1, -0.55)
-		target_rot = Combat.pose(attack_direction)
-	elif swing_time > 0:
-		var progress := 1.0 - swing_time / 0.3
-		target_rot = Combat.pose(attack_direction).lerp(Vector3(1.1, 0, 0.9 if attack_direction == 2 else -0.9), progress)
-		target_pos = Vector3(lerpf(-0.25 if attack_direction == 0 else 0.4, 0.4 if attack_direction == 0 else -0.25, progress), -0.2, -0.8)
-		if attack_direction == Combat.Direction.THRUST:
-			target_rot = Combat.pose(attack_direction)
-			target_pos = Vector3(0.1, -0.17, -0.5 - sin(progress * PI) * 0.65)
-	target_rot.x += recoil * 0.4
-	sword.position = sword.position.lerp(target_pos, minf(1, delta * 18))
-	sword.rotation = sword.rotation.lerp(target_rot, minf(1, delta * 20))
+	camera.rotation.z=lerpf(camera.rotation.z,deg_to_rad(combat.profile.swing_camera_roll)*( -1 if attack_direction==0 else 1) if combat.state==MeleeCombat.State.SWING else 0.0,delta*12)
 	stats_changed.emit()
+
+func apply_look(delta: float) -> void:
+	var look := pending_look
+	pending_look=Vector2.ZERO
+	var cap: float = combat.turn_cap() if is_instance_valid(combat) else 0.0
+	if cap>0: look=look.clamp(Vector2.ONE*-cap*delta,Vector2.ONE*cap*delta)
+	rotate_y(-look.x)
+	camera.rotation.x=clampf(camera.rotation.x-look.y,-1.25,1.25)
 
 func apply_input_frame(frame: PackedFloat64Array) -> int:
 	net_move=Vector2(frame[1],frame[2]).limit_length(1)
-	rotation.y=wrapf(frame[3],-PI,PI)
-	camera.rotation.x=clampf(frame[4],-1.25,1.25)
+	var cap: float = combat.turn_cap()
+	rotation.y=rotate_toward(rotation.y,wrapf(frame[3],-PI,PI),cap/Engine.physics_ticks_per_second) if cap>0 else wrapf(frame[3],-PI,PI)
+	var target_pitch := clampf(frame[4],-1.25,1.25)
+	camera.rotation.x=rotate_toward(camera.rotation.x,target_pitch,cap/Engine.physics_ticks_per_second) if cap>0 else target_pitch
 	select_direction(clampi(int(frame[5]),0,3))
 	var flags := int(frame[6])
 	net_block=bool(flags&1)
+	if net_block and not block_held: combat.queue_block(Combat.to_melee(selected_direction))
+	elif not net_block and block_held: combat.queue_block_release()
+	block_held=net_block
+	combat.hold_guard(net_block,Combat.to_melee(selected_direction))
 	net_sprint=bool(flags&2)
 	net_jump=bool(flags&4)
 	return int(frame[0])
 
 func simulate_movement(input: Vector2, running: bool, jump: bool, delta: float) -> void:
 	var direction := (transform.basis*Vector3(input.x,0,input.y)).normalized()
-	var speed := 2.2 if blocking else (7.5 if running else 4.4)
+	var speed: float = (7.5 if running and combat.state==MeleeCombat.State.IDLE else 4.4)*combat.move_multiplier()
 	velocity.x=move_toward(velocity.x,direction.x*speed+knockback.x,delta*30)
 	velocity.z=move_toward(velocity.z,direction.z*speed+knockback.z,delta*30)
 	if not is_on_floor(): velocity.y-=22*delta
@@ -231,83 +284,49 @@ func simulate_movement(input: Vector2, running: bool, jump: bool, delta: float) 
 		stamina-=12
 	net_jump=false
 	if running: stamina=maxf(0,stamina-17*delta)
-	elif cooldown==0 and not winding: stamina=minf(100,stamina+(10 if blocking else 23)*delta)
 	move_and_slide()
 	knockback=knockback.move_toward(Vector3.ZERO,delta*18)
 
 func attack(held := false) -> void:
-	if not active or not alive or cooldown > 0 or stamina < 20 or blocking or winding or stagger > 0:
-		return
+	if not active or not alive: return
 	if local_control: world.net.command("attack",selected_direction)
-	stamina -= 20
-	attack_direction = selected_direction
-	winding = true
-	windup = 0.0
-	release_requested = not held
-	stats_changed.emit()
+	combat.queue_windup(Combat.to_melee(selected_direction))
+	if not held: combat.queue_release()
+	combat.sync_view()
 
 func feint() -> bool:
-	if not winding or windup >= 0.65 or stamina < 8:
-		return false
-	if local_control: world.net.command("feint")
-	winding = false
-	stamina -= 8
-	cooldown = 0.16
-	recoil = 0.4
-	feedback("FINTE · Richtung wechseln", "feint")
-	return true
-
-func commit_attack() -> void:
-	winding = false
-	cooldown = 0.48
-	swing_time = 0.3
-	if local_control: world.sword_sound()
-	if world.net.running:
-		if world.net.hosting: world.net.resolve_attack(self)
-		return
-	var forward := -camera.global_transform.basis.z
-	var target: Node3D = null
-	var nearest := 3.5 if attack_direction == Combat.Direction.THRUST else 3.1
-	for enemy in get_tree().get_nodes_in_group("enemies"):
-		if not enemy.alive:
-			continue
-		var offset: Vector3 = enemy.global_position + Vector3(0, 1.0, 0) - camera.global_position
-		var distance := offset.length()
-		if distance < nearest and forward.dot(offset.normalized()) > (0.86 if attack_direction == Combat.Direction.THRUST else 0.64) and world.clear_line(camera.global_position, enemy.global_position + Vector3.UP, [get_rid(), enemy.get_rid()]):
-			nearest = distance
-			target = enemy
-	if target:
-		target.receive_attack(28.0 if weapon_level == 1 else 45.0, attack_direction, global_position)
-	else:
-		feedback("VERFEHLT", "miss")
-	stats_changed.emit()
+	var direction := Combat.to_melee(selected_direction)
+	if direction==combat.feint_base_dir(): direction=MeleeCombat.next_dir(direction)
+	var changed: bool = combat.feint_or_redirect(direction)
+	if changed:
+		if local_control: world.net.command("feint",Combat.from_melee(direction))
+		feedback("RICHTUNGSFINTE","feint")
+		combat.sync_view()
+	return changed
 
 func take_damage(amount: float, source: Vector3, incoming_direction := Combat.Direction.TOP) -> void:
-	if not alive:
-		return
-	var toward := (source - global_position).normalized()
-	var frontal := (-global_transform.basis.z).dot(toward) > 0.2
-	if blocking and frontal and guard_direction == incoming_direction and stamina >= 15:
-		var parry := block_age < 0.2
-		stamina -= 8 if parry else 15
-		recoil = 1.0
-		shake = 0.45
-		feedback("PERFEKTE PARADE" if parry else "BLOCK · " + Combat.NAMES[incoming_direction], "parry" if parry else "block")
-		world.impact(camera.global_position - camera.global_transform.basis.z * 0.7, true)
-		stats_changed.emit()
-		return
-	health = maxf(0, health - amount)
-	hurt_time = 0.5
-	shake = 1.0
-	recoil = 0.8
-	knockback = -toward * 2
-	stagger = 0.18
-	winding = false
-	cooldown = maxf(cooldown, 0.3)
-	feedback(("FALSCHE BLOCKRICHTUNG" if blocking and frontal else "GETROFFEN") + " · −%d" % int(amount), "hurt")
-	if health <= 0:
-		alive = false
-		collision_layer=0
-		collision_mask=0
-		if local_control: world.on_death()
-	stats_changed.emit()
+	# Environmental/debug damage; sword attacks go through the shared combat core.
+	if not alive: return
+	var toward := (source-position).normalized()
+	if blocking and (-basis.z).dot(toward)>0.2 and guard_direction==incoming_direction:
+		if block_age<combat.profile.parry_window:
+			feedback("PERFEKTE PARADE","parry")
+			return
+		var cost: float = amount*combat.profile.block_cost_ratio
+		stamina=maxf(0,stamina-cost)
+		if stamina>0:
+			feedback("BLOCK","block")
+			return
+		amount*=0.5
+	combat._take_damage(amount)
+	if alive: combat._stagger(combat.profile.flinch_time)
+	hurt_time=0.5
+	feedback("GETROFFEN","hurt")
+	combat.sync_view()
+
+func combat_death() -> void:
+	if not alive: return
+	alive=false
+	collision_layer=0
+	collision_mask=0
+	if local_control: world.on_death()
